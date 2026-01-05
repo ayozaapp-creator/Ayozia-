@@ -41,3 +41,15 @@ app-example
 # generated native folders
 /ios
 /android
+# secrets
+.env
+.env.*
+
+# server
+server/node_modules/
+
+# logs
+*.log
+
+# VS Code
+.vscode/
