@@ -53,3 +53,5 @@ server/node_modules/
 
 # VS Code
 .vscode/
+# Backend (separates Repo)
+server/
