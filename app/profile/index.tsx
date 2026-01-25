@@ -32,6 +32,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import AudioMiniPlayer from "../../components/audiominiplayer";
+import FollowRequestsBanner from "../../components/FollowRequestsBanner";
 import SnippetPlayerButton from "../../components/snippetplayerbutton";
 import TrackPlayButton from "../../components/trackplaybutton";
 
@@ -579,24 +580,49 @@ export default function MyProfileScreen() {
 
   const saveEdit = useCallback(async () => {
     if (!me || !canSave) return;
+
     try {
-      const updated: PublicUser = {
-        ...me,
+      const payload = {
         username: formUsername.trim(),
         bio: formBio,
-        avatarUrl: formAvatar || me.avatarUrl,
+        avatarUrl: formAvatar?.trim() || undefined,
+      };
+
+      const res = await fetch(`${API}/users/${me.id}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const txt = await res.text();
+        console.log("profile patch failed", res.status, txt);
+        Alert.alert("Fehler", "Server konnte Profil nicht speichern.");
+        return;
+      }
+
+      const json = await res.json();
+      const serverUser = json?.user;
+
+      const updated: PublicUser = {
+        ...me,
+        username: serverUser?.username ?? payload.username ?? me.username,
+        bio: serverUser?.bio ?? payload.bio ?? me.bio,
+        avatarUrl: serverUser?.avatarUrl ?? payload.avatarUrl ?? me.avatarUrl,
       };
 
       await AsyncStorage.setItem("user", JSON.stringify(updated));
       setMe(updated);
       setEditOpen(false);
-      Alert.alert("Gespeichert", "Dein Profil wurde aktualisiert (lokal).");
+      Alert.alert("Gespeichert", "Dein Profil wurde aktualisiert (Server).");
     } catch (e: any) {
       Alert.alert("Fehler", e?.message || "Konnte nicht speichern.");
     }
   }, [me, canSave, formUsername, formBio, formAvatar]);
 
-  const pickAndUploadAvatar = useCallback(async () => {
+const pickAndUploadAvatar = useCallback(async () => {
     try {
       if (!me?.id) return;
 
@@ -636,9 +662,7 @@ export default function MyProfileScreen() {
 
       const res = await fetch(`${API}/users/${me.id}/avatar`, {
         method: "POST",
-        headers: {
-          "Content-Type": "multipart/form-data",
-        },
+        // NOTE: In React Native, let fetch set the multipart boundary automatically.
         body: form,
       });
 
@@ -845,6 +869,9 @@ export default function MyProfileScreen() {
           <Text style={styles.btnEditText}>Profil teilen</Text>
         </TouchableOpacity>
       </View>
+
+      {/* Follow-Requests (nur wenn du selbst im Profil bist) */}
+      {me?.id ? <FollowRequestsBanner meId={String(me.id)} /> : null}
 
       {/* Stories-Zeile – "Neu" + echte Stories */}
       <View style={styles.highlightsWrap}>

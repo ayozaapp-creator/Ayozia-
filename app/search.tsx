@@ -1,6 +1,6 @@
 // app/search.tsx
 import { Ionicons } from "@expo/vector-icons";
-import { Link, useRouter } from "expo-router"; // ⬅️ Link hinzugefügt
+import { useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
@@ -20,8 +20,12 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 /* ================= Config ================= */
 const API = "http://192.168.0.224:5000";
 
-const SINCE_DAYS = 30;     // Wie lange gilt "neu"
-const LIMIT_NEW  = 200;    // Genug hoch setzen
+const SINCE_DAYS = 30; // Wie lange gilt "neu"
+const LIMIT_NEW = 200; // Neu angemeldet
+const ALL_USERS_CAP = 4000; // ✅ WICHTIG: niemals limit=0 (Freeze!)
+const SEARCH_MIN_CHARS = 2; // ✅ ab 2 Zeichen suchen (UI bleibt flüssig)
+const SEARCH_DEBOUNCE_MS = 250;
+const FILTER_CHUNK = 600; // ✅ Chunk-Filter, damit JS-Thread nicht blockiert
 
 /* ================= Types ================= */
 type User = {
@@ -68,6 +72,9 @@ export default function SearchScreen() {
   const allUsersRef = useRef<User[] | null>(null);
   const [loadingAll, setLoadingAll] = useState(false);
 
+  // Cancel laufende Chunk-Suche
+  const searchTokenRef = useRef(0);
+
   /* -------- Fetch helpers -------- */
   const fetchFresh = useCallback(async () => {
     try {
@@ -76,7 +83,6 @@ export default function SearchScreen() {
       const json = await res.json();
       const list: User[] = Array.isArray(json.users) ? json.users : [];
       setFresh(list);
-      // Debug: Anzahl loggen
       console.log("fresh users:", list.length);
     } catch (e) {
       console.warn("fetchFresh error:", e);
@@ -92,14 +98,20 @@ export default function SearchScreen() {
     setRefreshing(false);
   }, [fetchFresh]);
 
+  /**
+   * ✅ IMPORTANT:
+   * - NICHT limit=0, sonst kann JSON + Parsing die App "einfrieren"
+   * - wir cappen auf ALL_USERS_CAP
+   */
   const ensureAllUsers = useCallback(async () => {
     if (allUsersRef.current) return allUsersRef.current;
     try {
       setLoadingAll(true);
-      const res = await fetch(`${API}/users?limit=0&sort=createdAt&order=desc`);
+      const res = await fetch(`${API}/users?limit=${ALL_USERS_CAP}&sort=createdAt&order=desc`);
       const json = await res.json();
-      allUsersRef.current = (json.users ?? []) as User[];
-      return allUsersRef.current;
+      const list = Array.isArray(json.users) ? (json.users as User[]) : [];
+      allUsersRef.current = list;
+      return list;
     } catch (e) {
       console.warn("ensureAllUsers error:", e);
       allUsersRef.current = [];
@@ -114,32 +126,91 @@ export default function SearchScreen() {
     fetchFresh();
   }, [fetchFresh]);
 
-  /* -------- Debounced client-side search -------- */
+  // ✅ Navigation
+  const openProfile = useCallback(
+    (u: User) => {
+      if (!u?.id) return;
+      router.push({ pathname: "/profile/[id]", params: { id: String(u.id) } });
+    },
+    [router]
+  );
+
+  /**
+   * ✅ Chunked Filtering (UI bleibt flüssig)
+   * Filtert in Blöcken und yieldet zwischen den Blöcken.
+   */
+  const filterUsersChunked = useCallback(async (term: string) => {
+    const token = ++searchTokenRef.current;
+
+    const all = await ensureAllUsers();
+    if (token !== searchTokenRef.current) return;
+
+    const normalized = term.toLowerCase();
+
+    const out: User[] = [];
+    let i = 0;
+
+    const step = () =>
+      new Promise<void>((resolve) => {
+        setTimeout(() => {
+          const end = Math.min(i + FILTER_CHUNK, all.length);
+          for (; i < end; i++) {
+            const u = all[i];
+            const un = (u.username || "").toLowerCase();
+            const bio = (u.bio || "").toLowerCase();
+            if (un.includes(normalized) || bio.includes(normalized)) out.push(u);
+          }
+          resolve();
+        }, 0);
+      });
+
+    while (i < all.length) {
+      if (token !== searchTokenRef.current) return;
+      await step();
+      if (token !== searchTokenRef.current) return;
+
+      // ✅ optional: early stop wenn sehr viele Treffer
+      if (out.length >= 300) break;
+    }
+
+    if (token !== searchTokenRef.current) return;
+    setResults(out);
+  }, [ensureAllUsers]);
+
+  /* -------- Debounced client-side search (patched) -------- */
   useEffect(() => {
     if (debRef.current) clearTimeout(debRef.current);
+
+    const term = q.trim();
+    if (term.length === 0) {
+      searchTokenRef.current++; // cancel laufendes
+      setResults([]);
+      setSearching(false);
+      return;
+    }
+
+    // ✅ erst ab 2 Zeichen suchen (massiv weniger Freeze)
+    if (term.length < SEARCH_MIN_CHARS) {
+      searchTokenRef.current++; // cancel laufendes
+      setResults([]);
+      setSearching(false);
+      return;
+    }
+
     setSearching(true);
 
     debRef.current = setTimeout(async () => {
-      const term = q.trim().toLowerCase();
-      if (!term) {
-        setResults([]);
+      try {
+        await filterUsersChunked(term);
+      } finally {
         setSearching(false);
-        return;
       }
-      const all = await ensureAllUsers();
-      const filtered = (all || []).filter((u) => {
-        const un = u.username?.toLowerCase() || "";
-        const bio = u.bio?.toLowerCase() || "";
-        return un.includes(term) || bio.includes(term);
-      });
-      setResults(filtered);
-      setSearching(false);
-    }, 300);
+    }, SEARCH_DEBOUNCE_MS);
 
     return () => {
       if (debRef.current) clearTimeout(debRef.current);
     };
-  }, [q, ensureAllUsers]);
+  }, [q, filterUsersChunked]);
 
   const todayCount = useMemo(
     () =>
@@ -151,73 +222,49 @@ export default function SearchScreen() {
     [fresh]
   );
 
-  // ✅ WICHTIG: auf die korrekte Route zeigen -> "/profile/[id]"
-  const openProfile = (u: User) => {
-    if (!u?.id) return; // Guard, falls ein fehlerhafter Datensatz kommt
-    router.push({ pathname: "/profile/[id]", params: { id: String(u.id) } });
-  };
-
   /* ---------- UI pieces ---------- */
   const FreshBubble = ({ u }: { u: User }) => (
-    <Link
-      href={{ pathname: "/profile/[id]", params: { id: String(u.id) } }}
-      asChild
-    >
-      <TouchableOpacity
-        style={styles.storyWrap}
-        activeOpacity={0.9}
-        onPress={() => openProfile(u)} // Fallback bleibt aktiv
-      >
-        <View style={styles.storyRing}>
-          <View style={styles.storyCircle}>
-            {u.avatarUrl ? (
-              <Image
-                source={{ uri: u.avatarUrl }}
-                style={{ width: STORY_SIZE - 12, height: STORY_SIZE - 12, borderRadius: 999 }}
-              />
-            ) : (
-              <Ionicons name="person" size={28} color="#fff" />
-            )}
-          </View>
-          {isNewWithin(u.createdAt) && <View style={styles.newDot} />}
-        </View>
-        <Text style={styles.storyLabel} numberOfLines={1}>
-          @{u.username}
-        </Text>
-      </TouchableOpacity>
-    </Link>
-  );
-
-  const GridItem = ({ u }: { u: User }) => (
-    <Link
-      href={{ pathname: "/profile/[id]", params: { id: String(u.id) } }}
-      asChild
-    >
-      <TouchableOpacity
-        style={styles.gridItem}
-        activeOpacity={0.9}
-        onPress={() => openProfile(u)} // Fallback bleibt aktiv
-      >
-        <View style={styles.gridCircle}>
+    <TouchableOpacity style={styles.storyWrap} activeOpacity={0.9} onPress={() => openProfile(u)}>
+      <View style={styles.storyRing}>
+        <View style={styles.storyCircle}>
           {u.avatarUrl ? (
             <Image
               source={{ uri: u.avatarUrl }}
-              style={{ width: GRID_ITEM_W - 8, height: GRID_ITEM_W - 8, borderRadius: 999 }}
+              style={{ width: STORY_SIZE - 12, height: STORY_SIZE - 12, borderRadius: 999 }}
             />
           ) : (
-            <Ionicons name="person" size={26} color="#fff" />
+            <Ionicons name="person" size={28} color="#fff" />
           )}
         </View>
-        <Text style={styles.gridName} numberOfLines={1}>
-          @{u.username} {u.isVerified ? "✅" : ""}
-        </Text>
-        {isNewWithin(u.createdAt) && (
-          <View style={styles.gridNewPill}>
-            <Text style={styles.gridNewText}>NEU</Text>
-          </View>
+        {isNewWithin(u.createdAt) && <View style={styles.newDot} />}
+      </View>
+      <Text style={styles.storyLabel} numberOfLines={1}>
+        @{u.username}
+      </Text>
+    </TouchableOpacity>
+  );
+
+  const GridItem = ({ u }: { u: User }) => (
+    <TouchableOpacity style={styles.gridItem} activeOpacity={0.9} onPress={() => openProfile(u)}>
+      <View style={styles.gridCircle}>
+        {u.avatarUrl ? (
+          <Image
+            source={{ uri: u.avatarUrl }}
+            style={{ width: GRID_ITEM_W - 8, height: GRID_ITEM_W - 8, borderRadius: 999 }}
+          />
+        ) : (
+          <Ionicons name="person" size={26} color="#fff" />
         )}
-      </TouchableOpacity>
-    </Link>
+      </View>
+      <Text style={styles.gridName} numberOfLines={1}>
+        @{u.username} {u.isVerified ? "✅" : ""}
+      </Text>
+      {isNewWithin(u.createdAt) && (
+        <View style={styles.gridNewPill}>
+          <Text style={styles.gridNewText}>NEU</Text>
+        </View>
+      )}
+    </TouchableOpacity>
   );
 
   /* ---------- Render ---------- */
@@ -233,6 +280,9 @@ export default function SearchScreen() {
           value={q}
           onChangeText={setQ}
           returnKeyType="search"
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardAppearance="dark"
           onSubmitEditing={() => Keyboard.dismiss()}
         />
         {(searching || loadingAll) && <ActivityIndicator size="small" color="#aaa" />}
@@ -244,17 +294,18 @@ export default function SearchScreen() {
         <Text style={styles.infoText}>
           {loadingFresh
             ? "Lade neue Accounts …"
-            : `${fresh.length} neue Accounts in den letzten ${SINCE_DAYS} Tagen` }
+            : `${fresh.length} neue Accounts in den letzten ${SINCE_DAYS} Tagen`}
+          {todayCount > 0 ? ` • Heute: ${todayCount}` : ""}
         </Text>
       </View>
 
-      {/* Neu angemeldet – performant als FlatList horizontal */}
+      {/* Neu angemeldet */}
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Neu angemeldet</Text>
       </View>
       <FlatList
         data={fresh}
-        keyExtractor={(u) => String(u.id)} // defensiv
+        keyExtractor={(u) => String(u.id)}
         horizontal
         showsHorizontalScrollIndicator={false}
         contentContainerStyle={styles.storiesRow}
@@ -272,22 +323,24 @@ export default function SearchScreen() {
         initialNumToRender={12}
         maxToRenderPerBatch={20}
         windowSize={5}
+        keyboardShouldPersistTaps="handled"
       />
 
       {/* Ergebnisse */}
       <View style={styles.sectionHeader}>
         <Text style={styles.sectionTitle}>Ergebnisse</Text>
       </View>
+
       {q.trim().length === 0 ? (
-        <Text style={styles.hint}>
-          Tippe einen Namen, um nach Artists zu suchen.
-        </Text>
+        <Text style={styles.hint}>Tippe einen Namen, um nach Artists zu suchen.</Text>
+      ) : q.trim().length < SEARCH_MIN_CHARS ? (
+        <Text style={styles.hint}>Mindestens {SEARCH_MIN_CHARS} Zeichen eingeben…</Text>
       ) : results.length === 0 && !searching ? (
         <Text style={styles.hint}>Keine Treffer für „{q}“</Text>
       ) : (
         <FlatList
           data={results}
-          keyExtractor={(u) => String(u.id)} // defensiv
+          keyExtractor={(u) => String(u.id)}
           numColumns={GRID_COLS}
           columnWrapperStyle={{ justifyContent: "space-between", marginBottom: GRID_GAP }}
           contentContainerStyle={{ paddingHorizontal: 12, paddingBottom: 90, paddingTop: 6 }}
@@ -295,8 +348,6 @@ export default function SearchScreen() {
           keyboardShouldPersistTaps="handled"
         />
       )}
-
-     
     </View>
   );
 }

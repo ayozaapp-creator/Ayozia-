@@ -1,7 +1,7 @@
 // app/login.tsx — Login über eigenen Node-Server (kein Supabase mehr)
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import axios, { isAxiosError } from "axios";
+import axios from "axios";
 import { useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
@@ -43,7 +43,7 @@ export default function Login() {
         password: password.trim(),
       });
 
-      const data = res.data || {};
+      const data = (res.data || {}) as { user?: any; id?: string; email?: string; token?: string };
       const user = data.user || data; // dein Server schickt { message, user }
 
       if (!user || !user.id) {
@@ -69,7 +69,7 @@ export default function Login() {
     } catch (err: any) {
       console.log("LOGIN ERROR:", err);
 
-      if (isAxiosError(err)) {
+      if (err.response) {
         const msg =
           err.response?.data?.message ||
           err.response?.data?.error ||

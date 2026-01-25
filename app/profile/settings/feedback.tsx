@@ -1,5 +1,7 @@
 // app/profile/settings/feedback.tsx
 import { Ionicons } from "@expo/vector-icons";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { Platform } from "react-native";
 import { useRouter } from "expo-router";
 import { useState } from "react";
 import {
@@ -20,6 +22,8 @@ const TXT = "#ffffff";
 const TXT_DIM = "#9c9c9c";
 const ACCENT = "#ff4fd8";
 
+const API_BASE = (process.env as any)?.EXPO_PUBLIC_API_URL || "http://192.168.0.224:5000";
+
 export default function FeedbackScreen() {
   const router = useRouter();
 
@@ -28,7 +32,7 @@ export default function FeedbackScreen() {
   >(null);
   const [message, setMessage] = useState("");
 
-  const sendFeedback = () => {
+  const sendFeedback = async () => {
     if (!selectedType) {
       Alert.alert("Hinweis", "Bitte wähle zuerst eine Kategorie aus.");
       return;
@@ -38,13 +42,52 @@ export default function FeedbackScreen() {
       return;
     }
 
-    Alert.alert(
-      "Danke!",
-      "Dein Feedback wurde gespeichert. Wir melden uns bei Bedarf.",
-    );
+    try {
+      const rawUser = await AsyncStorage.getItem("user");
+      let userId: string | null = null;
+      if (rawUser) {
+        try {
+          const u = JSON.parse(rawUser);
+          userId = u?.id ? String(u.id) : null;
+        } catch {}
+      }
 
-    setSelectedType(null);
-    setMessage("");
+      const payload = {
+        userId,
+        type: selectedType,
+        title:
+          selectedType === "bug"
+            ? "App Feedback: Bug"
+            : selectedType === "idea"
+            ? "App Feedback: Idee"
+            : selectedType === "ui"
+            ? "App Feedback: UI/Design"
+            : "App Feedback",
+        message: message.trim(),
+        meta: {
+          platform: Platform.OS,
+          version: Platform.Version,
+          screen: "feedback",
+        },
+      };
+
+      const res = await fetch(`${API_BASE}/feedback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      if (!res.ok) {
+        const t = await res.text();
+        throw new Error(`Feedback konnte nicht gesendet werden (${res.status}): ${t}`);
+      }
+
+      Alert.alert("Danke!", "Dein Feedback wurde an unser Team gesendet.");
+      setSelectedType(null);
+      setMessage("");
+    } catch (e: any) {
+      Alert.alert("Fehler", e?.message || "Feedback konnte nicht gesendet werden.");
+    }
   };
 
   const Option = ({

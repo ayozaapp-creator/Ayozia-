@@ -3,6 +3,7 @@ import { StyleSheet } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import HomeScreen from "../components/homescreen";
 
+
 export default function Startseite() {
   return (
     <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>

@@ -14,7 +14,10 @@ import {
   View,
 } from "react-native";
 import { GestureHandlerRootView, Swipeable } from "react-native-gesture-handler";
-import BottomNavbar from "../../components/bottomnavbar"; // ✅ deine globale Navbar
+import BottomNavbar from "../../components/bottomnavbar";
+
+// ✅ NEU: Follow-Requests Banner (Insta-like)
+import FollowRequestsBanner from "../../components/FollowRequestsBanner";
 
 const API = "http://192.168.0.224:5000";
 
@@ -157,9 +160,7 @@ export default function ChatList() {
     if (!q.trim()) return convos;
     const s = q.trim().toLowerCase();
     return convos.filter(
-      (c) =>
-        c.name.toLowerCase().includes(s) ||
-        c.lastMessage.toLowerCase().includes(s)
+      (c) => c.name.toLowerCase().includes(s) || c.lastMessage.toLowerCase().includes(s)
     );
   }, [q, convos]);
 
@@ -223,6 +224,9 @@ export default function ChatList() {
             onChangeText={setQ}
           />
         </View>
+
+        {/* ✅ NEU: Insta Follow-Requests Banner im Chat Index */}
+        <FollowRequestsBanner />
 
         <ScrollView
           contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 90 }}

@@ -1,6 +1,6 @@
 // app/register.tsx — Register über eigenen Node-Server (kein Supabase mehr)
 
-import axios, { isAxiosError } from "axios";
+import axios from "axios";
 import { useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
@@ -48,16 +48,17 @@ export default function Register() {
 
       Alert.alert(
         "Erfolg",
-        res.data?.message || "Dein Konto wurde erstellt.",
+        (res.data as any)?.message || "Dein Konto wurde erstellt.",
         [{ text: "OK", onPress: () => router.replace("/login") }]
       );
     } catch (err: any) {
       console.log("REGISTER ERROR:", err);
 
-      if (isAxiosError(err)) {
+      if (err.response) {
+        const data = err.response?.data as any;
         const msg =
-          err.response?.data?.message ||
-          err.response?.data?.error ||
+          data?.message ||
+          data?.error ||
           err.message;
         Alert.alert("Fehler", msg || "Registrierung fehlgeschlagen.");
       } else {

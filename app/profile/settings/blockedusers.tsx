@@ -1,16 +1,18 @@
 // app/profile/settings/blocked-users.tsx
 import { Ionicons } from "@expo/vector-icons";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import axios from "axios";
 import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
 import {
-    ActivityIndicator,
-    Alert,
-    FlatList,
-    StyleSheet,
-    Text,
-    TouchableOpacity,
-    View,
+  ActivityIndicator,
+  Alert,
+  FlatList,
+  RefreshControl,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
@@ -21,98 +23,183 @@ const TXT = "#ffffff";
 const TXT_DIM = "#b5b5b5";
 const ACCENT = "#ff4fd8";
 
-type BlockedUser = {
+const API = "http://192.168.0.224:5000";
+
+const http = axios.create({
+  baseURL: API,
+  timeout: 15000,
+});
+
+type LoggedUser = {
   id: string;
-  username: string;
+  username?: string;
+  email?: string;
+};
+
+type SafeUser = {
+  id: string;
+  username?: string;
+  avatarUrl?: string | null;
+};
+
+type BlockedItem = {
+  blockedId: string;
   reason?: string;
+  createdAt?: string;
+  user?: SafeUser;
+};
+
+type BlockedResponse = {
+  userId: string;
+  blocked: BlockedItem[];
 };
 
 export default function BlockedUsersScreen() {
   const router = useRouter();
+
+  const [me, setMe] = useState<LoggedUser | null>(null);
   const [loading, setLoading] = useState(true);
-  const [blocked, setBlocked] = useState<BlockedUser[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const [blocked, setBlocked] = useState<BlockedItem[]>([]);
+  const [savingId, setSavingId] = useState<string | null>(null);
+
+  const loadMe = async (): Promise<LoggedUser | null> => {
+    // ✅ Robust: akzeptiere mehrere Keys & Strukturen (u oder {user:u})
+    const keys = ["me", "user", "@user", "ayo_user", "auth_user", "ayozia_user", "currentUser"];
+    for (const k of keys) {
+      const raw = await AsyncStorage.getItem(k);
+      if (!raw) continue;
+
+      try {
+        const j = JSON.parse(raw);
+        const u = j?.user?.id ? j.user : j;
+        if (!u?.id) continue;
+
+        return { id: String(u.id), username: u.username, email: u.email };
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  };
+
+  const fetchBlocked = async (userId: string) => {
+    const res = await http.get<BlockedResponse>(`/users/${userId}/blocked`, {
+      params: { viewer: userId },
+    });
+    const list = Array.isArray(res.data?.blocked) ? res.data.blocked : [];
+    setBlocked(list);
+  };
 
   useEffect(() => {
     (async () => {
       try {
-        const raw = await AsyncStorage.getItem("ayoza_blocked_users");
-        if (raw) {
-          setBlocked(JSON.parse(raw));
-        } else {
-          // Demo-Daten – später mit echtem Backend füttern (z.B. /users/blocked)
-          setBlocked([
-            {
-              id: "demo-1",
-              username: "loud_spammer",
-              reason: "Spam-Nachrichten",
-            },
-            {
-              id: "demo-2",
-              username: "toxic_user",
-              reason: "Beleidigendes Verhalten",
-            },
-          ]);
+        const u = await loadMe();
+        if (!u) {
+          Alert.alert("Nicht eingeloggt", "Bitte zuerst einloggen.");
+          setLoading(false);
+          return;
         }
-      } catch (e) {
-        console.log("Blocked users load error:", e);
+        setMe(u);
+        await fetchBlocked(u.id);
+      } catch (e: any) {
+        console.log("blocked load error:", e?.message ?? e);
+        Alert.alert(
+          "Fehler",
+          "Blockierte Nutzer konnten nicht geladen werden. Prüfe Server/Verbindung."
+        );
       } finally {
         setLoading(false);
       }
     })();
   }, []);
 
-  const saveBlocked = async (list: BlockedUser[]) => {
+  const onRefresh = async () => {
+    if (!me?.id) return;
     try {
-      setBlocked(list);
-      await AsyncStorage.setItem("ayoza_blocked_users", JSON.stringify(list));
-    } catch (e) {
-      console.log("Blocked users save error:", e);
+      setRefreshing(true);
+      await fetchBlocked(me.id);
+    } catch (e: any) {
+      console.log("blocked refresh error:", e?.message ?? e);
+      Alert.alert("Fehler", "Aktualisieren fehlgeschlagen.");
+    } finally {
+      setRefreshing(false);
     }
   };
 
-  const handleUnblock = (user: BlockedUser) => {
-    Alert.alert(
-      "Entsperren",
-      `Möchtest du @${user.username} wirklich entsperren?`,
-      [
-        { text: "Abbrechen", style: "cancel" },
-        {
-          text: "Entsperren",
-          style: "destructive",
-          onPress: () => {
-            const filtered = blocked.filter((u) => u.id !== user.id);
-            saveBlocked(filtered);
-          },
+  const handleUnblock = (item: BlockedItem) => {
+    if (!me?.id) return;
+
+    const username =
+      item?.user?.username || (item.blockedId ? item.blockedId : "Nutzer");
+
+    Alert.alert("Entsperren", `Möchtest du @${username} wirklich entsperren?`, [
+      { text: "Abbrechen", style: "cancel" },
+      {
+        text: "Entsperren",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            setSavingId(item.blockedId);
+            await http.post(`/users/${me.id}/unblock`, {
+              viewerId: me.id,
+              blockedId: item.blockedId,
+            });
+
+            // UI sofort aktualisieren
+            setBlocked((prev) =>
+              prev.filter((x) => String(x.blockedId) !== String(item.blockedId))
+            );
+          } catch (e: any) {
+            console.log("unblock error:", e?.message ?? e);
+            Alert.alert(
+              "Fehler",
+              "Entsperren fehlgeschlagen. Prüfe Server/Verbindung."
+            );
+          } finally {
+            setSavingId(null);
+          }
         },
-      ]
-    );
+      },
+    ]);
   };
 
-  const renderItem = ({ item }: { item: BlockedUser }) => (
-    <View style={styles.userRow}>
-      <View style={styles.userLeft}>
-        <View style={styles.avatarPlaceholder}>
-          <Ionicons name="person-circle-outline" size={30} color={TXT_DIM} />
-        </View>
-        <View style={{ flex: 1 }}>
-          <Text style={styles.usernameText}>@{item.username}</Text>
-          {item.reason ? (
-            <Text style={styles.reasonText}>{item.reason}</Text>
-          ) : (
-            <Text style={styles.reasonText}>Blockiert</Text>
-          )}
-        </View>
-      </View>
+  const renderItem = ({ item }: { item: BlockedItem }) => {
+    const username = item?.user?.username || "unbekannt";
+    const reason = item?.reason?.trim() ? item.reason : "Blockiert";
+    const isSaving = savingId === item.blockedId;
 
-      <TouchableOpacity
-        style={styles.unblockBtn}
-        onPress={() => handleUnblock(item)}
-      >
-        <Ionicons name="remove-circle-outline" size={18} color={ACCENT} />
-        <Text style={styles.unblockText}>Entsperren</Text>
-      </TouchableOpacity>
-    </View>
-  );
+    return (
+      <View style={styles.userRow}>
+        <View style={styles.userLeft}>
+          <View style={styles.avatarPlaceholder}>
+            <Ionicons name="person-circle-outline" size={30} color={TXT_DIM} />
+          </View>
+
+          <View style={{ flex: 1 }}>
+            <Text style={styles.usernameText}>@{username}</Text>
+            <Text style={styles.reasonText}>{reason}</Text>
+          </View>
+        </View>
+
+        <TouchableOpacity
+          style={[styles.unblockBtn, isSaving && { opacity: 0.6 }]}
+          onPress={() => handleUnblock(item)}
+          disabled={isSaving}
+        >
+          {isSaving ? (
+            <ActivityIndicator size="small" color={ACCENT} />
+          ) : (
+            <>
+              <Ionicons name="remove-circle-outline" size={18} color={ACCENT} />
+              <Text style={styles.unblockText}>Entsperren</Text>
+            </>
+          )}
+        </TouchableOpacity>
+      </View>
+    );
+  };
 
   return (
     <SafeAreaView style={styles.safe}>
@@ -139,17 +226,13 @@ export default function BlockedUsersScreen() {
           <View style={styles.content}>
             {/* Info-Karte */}
             <View style={styles.infoCard}>
-              <Ionicons
-                name="hand-left-outline"
-                size={22}
-                color={ACCENT}
-              />
+              <Ionicons name="hand-left-outline" size={22} color={ACCENT} />
               <View style={{ marginLeft: 10, flex: 1 }}>
                 <Text style={styles.infoTitle}>Blockierte Accounts</Text>
                 <Text style={styles.infoText}>
-                  Nutzer auf dieser Liste können dein Profil nicht sehen,
-                  dir keine Nachrichten schicken und nicht mit deinen Inhalten
-                  interagieren – ähnlich wie bei Instagram.
+                  Nutzer auf dieser Liste können dein Profil nicht sehen, dir
+                  keine Nachrichten schicken und nicht mit deinen Inhalten
+                  interagieren –
                 </Text>
               </View>
             </View>
@@ -165,18 +248,25 @@ export default function BlockedUsersScreen() {
                   />
                   <Text style={styles.emptyTitle}>Keine blockierten Nutzer</Text>
                   <Text style={styles.emptyText}>
-                    Du hast aktuell niemanden blockiert.  
-                    Wenn du jemanden blockierst, erscheint der Account hier.
+                    Du hast aktuell niemanden blockiert. Wenn du jemanden
+                    blockierst, erscheint der Account hier.
                   </Text>
                 </View>
               ) : (
                 <FlatList
                   data={blocked}
-                  keyExtractor={(item) => item.id}
+                  keyExtractor={(item) => String(item.blockedId)}
                   renderItem={renderItem}
                   ItemSeparatorComponent={() => (
                     <View style={styles.separator} />
                   )}
+                  refreshControl={
+                    <RefreshControl
+                      refreshing={refreshing}
+                      onRefresh={onRefresh}
+                      tintColor={ACCENT}
+                    />
+                  }
                 />
               )}
             </View>
@@ -235,97 +325,95 @@ const styles = StyleSheet.create({
     backgroundColor: CARD,
     borderRadius: 14,
     padding: 14,
-    borderWidth: StyleSheet.hairlineWidth,
+    borderWidth: 1,
     borderColor: BORDER,
-    marginBottom: 18,
+    marginBottom: 14,
   },
   infoTitle: {
     color: TXT,
     fontSize: 14,
-    fontWeight: "600",
+    fontWeight: "800",
   },
   infoText: {
     color: TXT_DIM,
-    fontSize: 12,
-    marginTop: 4,
+    marginTop: 3,
+    lineHeight: 18,
   },
   card: {
-    flex: 1,
     backgroundColor: CARD,
     borderRadius: 14,
-    borderWidth: StyleSheet.hairlineWidth,
+    borderWidth: 1,
     borderColor: BORDER,
-    paddingVertical: 4,
+    overflow: "hidden",
+  },
+  emptyWrap: {
+    padding: 18,
+    alignItems: "center",
+  },
+  emptyTitle: {
+    marginTop: 8,
+    color: TXT,
+    fontWeight: "800",
+    fontSize: 14,
+  },
+  emptyText: {
+    marginTop: 6,
+    color: TXT_DIM,
+    textAlign: "center",
+    lineHeight: 18,
+  },
+  separator: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: BORDER,
+    marginLeft: 12,
   },
   userRow: {
+    padding: 12,
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 14,
-    paddingVertical: 10,
     justifyContent: "space-between",
+    gap: 12,
   },
   userLeft: {
     flexDirection: "row",
     alignItems: "center",
     flex: 1,
-    paddingRight: 10,
+    gap: 10,
   },
   avatarPlaceholder: {
     width: 38,
     height: 38,
-    borderRadius: 999,
+    borderRadius: 19,
+    backgroundColor: "#0f0f0f",
     borderWidth: 1,
     borderColor: BORDER,
     alignItems: "center",
     justifyContent: "center",
-    marginRight: 10,
-    backgroundColor: "#101010",
   },
   usernameText: {
     color: TXT,
+    fontWeight: "900",
     fontSize: 14,
-    fontWeight: "600",
   },
   reasonText: {
     color: TXT_DIM,
-    fontSize: 11,
     marginTop: 2,
+    fontSize: 12,
   },
   unblockBtn: {
     flexDirection: "row",
     alignItems: "center",
-    paddingVertical: 6,
-    paddingHorizontal: 10,
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: ACCENT,
+    backgroundColor: "#0f0f0f",
   },
   unblockText: {
     color: ACCENT,
+    fontWeight: "900",
     fontSize: 12,
-    fontWeight: "600",
-    marginLeft: 4,
-  },
-  separator: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: BORDER,
-    marginLeft: 62, // unter Avatar + Text, wie Insta
-  },
-  emptyWrap: {
-    alignItems: "center",
-    paddingVertical: 26,
-    paddingHorizontal: 20,
-  },
-  emptyTitle: {
-    color: TXT,
-    fontSize: 15,
-    fontWeight: "600",
-    marginTop: 8,
-  },
-  emptyText: {
-    color: TXT_DIM,
-    fontSize: 12,
-    textAlign: "center",
-    marginTop: 4,
   },
 });

@@ -1,0 +1,8 @@
+{
+  "language": {
+    "title": "Language",
+    "activeLanguage": "Active Language",
+    "hint": "This setting applies to the entire app.",
+    "saving": "Saving..."
+  }
+}

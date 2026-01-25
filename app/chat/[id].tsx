@@ -6,6 +6,7 @@ import { useLocalSearchParams, useRouter } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActionSheetIOS,
+  ActivityIndicator,
   Alert,
   Animated,
   Easing,
@@ -39,7 +40,6 @@ import { useVoiceMessage, type StoredVoiceMsg } from "./usevoicemessage";
 import type { Media as CameraMedia } from "./camera";
 
 const API = "http://192.168.0.224:5000";
-
 
 /* ───────────── Types ───────────── */
 type ServerMsg = {
@@ -160,6 +160,12 @@ export default function ChatRoom() {
   // Polling-Timer
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // 🔒 Privacy State (Instagram-Like)
+  const [privacyLoading, setPrivacyLoading] = useState(true);
+  const [partnerPrivate, setPartnerPrivate] = useState(false);
+  const [following, setFollowing] = useState(true); // default: true, damit Chat nicht “aus Versehen” blockiert
+  const isLocked = useMemo(() => partnerPrivate && !following, [partnerPrivate, following]);
+
   // mic animation
   const micScale = useRef(new Animated.Value(1)).current;
   const animateMicIn = () =>
@@ -199,27 +205,74 @@ export default function ChatRoom() {
     }
   }, []);
 
-  const markAllRead = useCallback(
-    async (_mid: string, _pid: string, list: ServerMsg[]) => {
+  // 🔒 Privacy Loader (Instagram-Like)
+  const loadPrivacy = useCallback(
+    async (mid?: string | null, pid?: string | null) => {
+      if (!mid || !pid) return;
+      setPrivacyLoading(true);
+
       try {
-        const myIncoming = list.filter((m) => m.toId === _mid && !m.read);
-        await Promise.all(
-          myIncoming.map((m) =>
-            fetch(`${API}/messages/read`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ messageId: m.id, userId: _mid }),
-            })
-          )
+        // 1) isPrivate vom Partner holen
+        // Erwartet: { isPrivate: boolean }
+        const r1 = await fetch(`${API}/users/${encodeURIComponent(pid)}/privacy`);
+        if (r1.ok) {
+          const j1 = (await r1.json()) as { isPrivate?: boolean };
+          setPartnerPrivate(!!j1?.isPrivate);
+        } else {
+          // falls Endpoint noch nicht existiert -> NICHT blockieren
+          setPartnerPrivate(false);
+        }
+      } catch {
+        setPartnerPrivate(false);
+      }
+
+      try {
+        // 2) Follow-Status holen
+        // Erwartet: { following: boolean }
+        const r2 = await fetch(
+          `${API}/follow/status?fromId=${encodeURIComponent(mid)}&toId=${encodeURIComponent(pid)}`
         );
-      } catch {}
+        if (r2.ok) {
+          const j2 = (await r2.json()) as { following?: boolean };
+          setFollowing(!!j2?.following);
+        } else {
+          // falls Endpoint noch nicht existiert -> NICHT blockieren
+          setFollowing(true);
+        }
+      } catch {
+        setFollowing(true);
+      } finally {
+        setPrivacyLoading(false);
+      }
     },
     []
   );
 
+  const markAllRead = useCallback(async (_mid: string, _pid: string, list: ServerMsg[]) => {
+    try {
+      const myIncoming = list.filter((m) => m.toId === _mid && !m.read);
+      await Promise.all(
+        myIncoming.map((m) =>
+          fetch(`${API}/messages/read`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ messageId: m.id, userId: _mid }),
+          })
+        )
+      );
+    } catch {}
+  }, []);
+
   const fetchThread = useCallback(
     async (mid?: string | null, pid?: string | null) => {
       if (!mid || !pid) return;
+
+      // 🔒 Wenn locked: keine Messages laden/zeigen
+      if (partnerPrivate && !following) {
+        setMessages([]);
+        return;
+      }
+
       const chatId = getChatId(mid, pid);
       const res = await fetch(`${API}/messages/${encodeURIComponent(chatId)}`);
       const json = (await res.json()) as { messages: ServerMsg[] };
@@ -227,12 +280,15 @@ export default function ChatRoom() {
       setMessages(arr.map((m) => asMsg(m, mid)));
       void markAllRead(mid, pid, arr);
     },
-    [markAllRead]
+    [markAllRead, partnerPrivate, following]
   );
 
   const sendToServer = useCallback(
     async (payload: Partial<ServerMsg> & { fromId: string; toId: string }) => {
       try {
+        // 🔒 Sicherheits-Guard: wenn locked, gar nicht senden
+        if (partnerPrivate && !following) return;
+
         const res = await fetch(`${API}/messages/send`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -244,15 +300,18 @@ export default function ChatRoom() {
         /* optimistische Bubble bleibt stehen */
       }
     },
-    [fetchThread]
+    [fetchThread, partnerPrivate, following]
   );
 
   /* ───────────── Bootstrap + Polling ───────────── */
   const bootstrap = useCallback(async () => {
     const mid = (await loadMe()) || meId;
     if (!mid || !partner || mid === partner) return;
+
+    // 🔒 zuerst Privacy laden, dann ggf. Thread
+    await loadPrivacy(mid, partner);
     await fetchThread(mid, partner);
-  }, [loadMe, meId, partner, fetchThread]);
+  }, [loadMe, meId, partner, fetchThread, loadPrivacy]);
 
   useEffect(() => {
     (async () => {
@@ -260,8 +319,12 @@ export default function ChatRoom() {
     })();
   }, [bootstrap]);
 
+  // 🔒 Polling nur wenn nicht locked
   useEffect(() => {
     if (!meId || !partner || meId === partner) return;
+    if (privacyLoading) return;
+    if (isLocked) return;
+
     pollingRef.current = setInterval(async () => {
       try {
         await fetchThread(meId, partner);
@@ -271,7 +334,7 @@ export default function ChatRoom() {
     return () => {
       if (pollingRef.current) clearInterval(pollingRef.current);
     };
-  }, [meId, partner, fetchThread]);
+  }, [meId, partner, fetchThread, isLocked, privacyLoading]);
 
   /* ───────────── Scroll-to-end Verhalten ───────────── */
   useEffect(() => {
@@ -292,10 +355,7 @@ export default function ChatRoom() {
   }, [messages.length]);
 
   /* ───────────── Voice Hook ───────────── */
-  const threadChatId = useMemo(
-    () => (meId && partner ? getChatId(meId, String(partner)) : ""),
-    [meId, partner]
-  );
+  const threadChatId = useMemo(() => (meId && partner ? getChatId(meId, String(partner)) : ""), [meId, partner]);
   const vm = useVoiceMessage(threadChatId, meId ?? "", String(partner));
 
   // Recorder-UI spiegeln
@@ -349,13 +409,15 @@ export default function ChatRoom() {
 
   // 3) Zusammenführen + sortieren
   const combinedMessages: Msg[] = useMemo(() => {
+    // 🔒 Wenn locked: absolut nichts anzeigen
+    if (partnerPrivate && !following) return [];
     const all = [...messages, ...localVoiceMsgs];
     return all.sort((a, b) => {
       const ta = a._localVoice?.createdAtMs ?? (a.createdAt ? Date.parse(a.createdAt) : 0);
       const tb = b._localVoice?.createdAtMs ?? (b.createdAt ? Date.parse(b.createdAt) : 0);
       return ta - tb;
     });
-  }, [messages, localVoiceMsgs]);
+  }, [messages, localVoiceMsgs, partnerPrivate, following]);
 
   /* ===== Helpers (nach combinedMessages!) ===== */
   const buildReplySnapshot = useCallback(
@@ -374,6 +436,8 @@ export default function ChatRoom() {
   /* ───────────── Message helpers ───────────── */
   const appendMediaMessage = (media: Media) => {
     if (!meId || !partner) return;
+    if (partnerPrivate && !following) return;
+
     const optimistic: Msg = {
       id: `${Date.now()}`,
       text: "",
@@ -393,6 +457,8 @@ export default function ChatRoom() {
 
   const appendVoiceMessage = (note: VoiceNote) => {
     if (!meId || !partner) return;
+    if (partnerPrivate && !following) return;
+
     const optimistic: Msg = {
       id: `${Date.now()}`,
       text: "",
@@ -413,6 +479,8 @@ export default function ChatRoom() {
   /** 🔧 Text senden */
   const sendMessage = () => {
     if (!meId || !partner) return;
+    if (partnerPrivate && !following) return;
+
     const txt = input.trim();
     if (!txt) return;
 
@@ -441,6 +509,7 @@ export default function ChatRoom() {
   // Galerie
   const pickMedia = async () => {
     try {
+      if (partnerPrivate && !following) return;
       const media = await pickOneMedia();
       if (media) appendMediaMessage(media);
     } catch {}
@@ -448,11 +517,14 @@ export default function ChatRoom() {
 
   // Kamera → öffnet CameraModal
   const openCameraModal = (mode: "photo" | "video") => {
+    if (partnerPrivate && !following) return;
     setCamMode(mode);
     setCamOpen(true);
   };
 
   const chooseCameraMode = () => {
+    if (partnerPrivate && !following) return;
+
     if (Platform.OS === "ios") {
       ActionSheetIOS.showActionSheetWithOptions(
         { options: ["Abbrechen", "Foto aufnehmen", "Video aufnehmen"], cancelButtonIndex: 0 },
@@ -473,6 +545,8 @@ export default function ChatRoom() {
   // Emoji-Reaktionen
   const handlePickEmoji = (emoji: string) => {
     if (!showEmojiFor) return;
+    if (partnerPrivate && !following) return;
+
     setMessages((prev) => prev.map((m) => (m.id === showEmojiFor ? { ...m, reaction: emoji } : m)));
     setReactions((prev) => ({ ...prev, [showEmojiFor]: emoji }));
     (async () => {
@@ -489,6 +563,8 @@ export default function ChatRoom() {
 
   // Löschen (Server + lokale Voice)
   const confirmDelete = (mid: string) => {
+    if (partnerPrivate && !following) return;
+
     const localVoices = vm.messages.map(mapStoredVoiceToMsg);
     const item = [...messages, ...localVoices].find((m) => m.id === mid);
 
@@ -516,6 +592,7 @@ export default function ChatRoom() {
   };
 
   const selectReply = (mid: string) => {
+    if (partnerPrivate && !following) return;
     setReplyToId(mid);
     requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
   };
@@ -523,6 +600,8 @@ export default function ChatRoom() {
   // voice – Start/Stop
   const startVoice = async () => {
     try {
+      if (partnerPrivate && !following) return;
+
       if (!threadChatId || !meId) {
         Alert.alert("Sprachmemo", "User-ID oder Chat-ID noch nicht geladen.");
         return;
@@ -641,18 +720,12 @@ export default function ChatRoom() {
                   <Text style={{ fontSize: 12 }}>{effectiveReaction}</Text>
                 </View>
               )}
-              {item.sender === "me" && item.read && !isLocalVoice && (
-                <Text style={{ color: "#777", fontSize: 11 }}>✓✓ gelesen</Text>
-              )}
+              {item.sender === "me" && item.read && !isLocalVoice && <Text style={{ color: "#777", fontSize: 11 }}>✓✓ gelesen</Text>}
 
               {isLocalVoice && (
                 <>
-                  {item._localVoice?.status === "pending" && (
-                    <Text style={{ color: "#aaa", fontSize: 11 }}>Wartet auf Upload…</Text>
-                  )}
-                  {item._localVoice?.status === "uploading" && (
-                    <Text style={{ color: "#aaa", fontSize: 11 }}>Wird hochgeladen…</Text>
-                  )}
+                  {item._localVoice?.status === "pending" && <Text style={{ color: "#aaa", fontSize: 11 }}>Wartet auf Upload…</Text>}
+                  {item._localVoice?.status === "uploading" && <Text style={{ color: "#aaa", fontSize: 11 }}>Wird hochgeladen…</Text>}
                   {item._localVoice?.status === "error" && (
                     <View style={{ flexDirection: "row", gap: 10, alignItems: "center" }}>
                       <Text style={{ color: "#ff7a7a", fontSize: 11 }}>
@@ -666,9 +739,7 @@ export default function ChatRoom() {
                       </TouchableOpacity>
                     </View>
                   )}
-                  {item._localVoice?.status === "sent" && (
-                    <Text style={{ color: "#777", fontSize: 11 }}>✓✓ gesendet</Text>
-                  )}
+                  {item._localVoice?.status === "sent" && <Text style={{ color: "#777", fontSize: 11 }}>✓✓ gesendet</Text>}
                 </>
               )}
             </View>
@@ -720,13 +791,7 @@ export default function ChatRoom() {
         <View style={styles.replyChipBar} />
         <Text style={styles.replyTitle}>Antwort an</Text>
         <Text style={styles.replyText} numberOfLines={1}>
-          {snap
-            ? snap.kind === "media"
-              ? "📎 Medien"
-              : snap.kind === "voice"
-              ? "🎙 Sprachmemo"
-              : snap.text || "Nachricht"
-            : "Nachricht"}
+          {snap ? (snap.kind === "media" ? "📎 Medien" : snap.kind === "voice" ? "🎙 Sprachmemo" : snap.text || "Nachricht") : "Nachricht"}
         </Text>
         <TouchableOpacity onPress={() => setReplyToId(null)} style={styles.replyClose}>
           <Ionicons name="close" size={14} color="#fff" />
@@ -740,158 +805,213 @@ export default function ChatRoom() {
     router.back();
   };
 
+  // 🔒 Follow Button
+  const followNow = async () => {
+    if (!meId || !partner) return;
+    try {
+      const res = await fetch(`${API}/follow`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fromId: meId, toId: partner }),
+      });
+
+      if (!res.ok) {
+        // wenn dein Server "Request sent" statt direct follow macht, kannst du hier text ändern
+        Alert.alert("Folgen", "Konnte nicht folgen. Prüfe deinen Server.");
+        return;
+      }
+
+      // Direkt freischalten wie Insta (oder: Request gesendet)
+      setFollowing(true);
+      setPrivacyLoading(false);
+
+      // Danach Thread laden
+      await fetchThread(meId, partner);
+    } catch {
+      Alert.alert("Folgen", "Netzwerkfehler.");
+    }
+  };
+
+  // 🔒 Locked Screen (Instagram-Like)
+  const lockedScreen = (
+    <View style={styles.lockWrap}>
+      <View style={styles.lockCard}>
+        <View style={styles.lockIcon}>
+          <Ionicons name="lock-closed" size={22} color="#fff" />
+        </View>
+        <Text style={styles.lockTitle}>Dieser Account ist privat</Text>
+        <Text style={styles.lockText}>
+          Folge @{name || partner}, um Nachrichten und Inhalte zu sehen.
+        </Text>
+
+        <View style={{ height: 12 }} />
+
+        <TouchableOpacity onPress={followNow} style={styles.followBtn} activeOpacity={0.9}>
+          <Text style={styles.followBtnText}>Folgen</Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          onPress={async () => {
+            if (!meId || !partner) return;
+            await loadPrivacy(meId, partner);
+            await fetchThread(meId, partner);
+          }}
+          style={styles.refreshBtn}
+          activeOpacity={0.85}
+        >
+          <Ionicons name="refresh" size={16} color="#fff" />
+          <Text style={styles.refreshText}>Aktualisieren</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+
   return (
     <SafeAreaView style={styles.safe} edges={["left", "right", "bottom"]}>
       {/* Schlauer Avoider reduziert den Abstand zur Tastatur */}
       <KeyboardAvoider>
         <View style={styles.flex}>
           {/* Header */}
-          <View
-            style={[styles.header, { paddingTop: insets.top + 6 }]}
-            onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}
-          >
+          <View style={[styles.header, { paddingTop: insets.top + 6 }]} onLayout={(e) => setHeaderH(e.nativeEvent.layout.height)}>
             <View style={styles.headerLeft}>
-              <TouchableOpacity
-                onPress={goBack}
-                style={{ padding: 6 }}
-                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-              >
+              <TouchableOpacity onPress={goBack} style={{ padding: 6 }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
                 <Ionicons name="chevron-back" size={24} color="#fff" />
               </TouchableOpacity>
               <Text style={styles.chatName}>@{name || partner}</Text>
             </View>
 
-            <TouchableOpacity
-              onPress={() => setShowOptions((v) => !v)}
-              style={{ padding: 6 }}
-              hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-            >
+            <TouchableOpacity onPress={() => setShowOptions((v) => !v)} style={{ padding: 6 }} hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}>
               <Ionicons name="ellipsis-vertical" size={20} color="#fff" />
             </TouchableOpacity>
           </View>
 
-          {/* Liste */}
-          <FlatList
-            ref={listRef}
-            data={combinedMessages}
-            keyExtractor={(it) => it.id}
-            renderItem={renderItem}
-            contentContainerStyle={{
-              paddingHorizontal: PAD_H,
-              paddingTop: PAD_TOP,
-              paddingBottom: composerH + (replyToId ? 44 : 0) + Math.max(insets.bottom, 2),
-            }}
-            showsVerticalScrollIndicator={false}
-            keyboardShouldPersistTaps="handled"
-            keyboardDismissMode={Platform.OS === "ios" ? "on-drag" : "none"}
-            onScrollBeginDrag={() => {
-              Keyboard.dismiss();
-              setShowEmojiFor(null);
-            }}
-            onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
-            onLayout={() => requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: false }))}
-            onScroll={(e) => setScrollY(e.nativeEvent.contentOffset.y)}
-            scrollEventThrottle={16}
-            scrollEnabled={!recOn}
-          />
-
-          {/* Emoji-Overlay */}
-          {emojiOverlay}
-
-          {/* Reply-Preview */}
-          {replyPreview}
-
-          {/* Recording Banner */}
-          {recOn && (
-            <View style={styles.recordBanner}>
-              <View className="dot" style={styles.dot} />
-              <Text style={styles.recordText}>Aufnahme läuft…</Text>
-              <Text style={styles.recordTimer}>{msToClock(recMs)}</Text>
-              {recLocked && (
-                <TouchableOpacity onPress={stopAndSendVoice} style={styles.stopBtn}>
-                  <Ionicons name="stop" size={16} color="#fff" />
-                </TouchableOpacity>
-              )}
+          {/* Privacy Loading */}
+          {privacyLoading ? (
+            <View style={styles.loadingWrap}>
+              <ActivityIndicator />
+              <Text style={styles.loadingText}>Lade…</Text>
             </View>
-          )}
-
-          {/* Options-Backdrop */}
-          {showOptions && (
-            <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
-              <TouchableOpacity
-                style={StyleSheet.absoluteFill}
-                activeOpacity={1}
-                onPress={() => setShowOptions(false)}
-              />
-              <OptionsMenu input={input} setInput={setInput} onClose={() => setShowOptions(false)} />
-            </View>
-          )}
-
-          {/* Composer */}
-          <View style={styles.composer} onLayout={(e) => setComposerH(e.nativeEvent.layout.height)}>
-            {/* Kamera */}
-            <TouchableOpacity
-              style={styles.iconCircle}
-              onPress={() => openCameraModal("photo")}
-              onLongPress={chooseCameraMode}
-            >
-              <Ionicons name="camera-outline" size={18} color="#fff" />
-            </TouchableOpacity>
-
-            {/* Eingabe */}
-            <View style={styles.inputWrap}>
-              <TextInput
-                style={styles.input}
-                placeholder={replyToId ? "Antwort schreiben…" : "Nachricht schreiben…"}
-                placeholderTextColor="#8a8a8a"
-                value={input}
-                onChangeText={setInput}
-                onFocus={() => {
-                  setShowEmojiFor(null);
-                  requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
+          ) : isLocked ? (
+            // 🔒 Wenn privat + nicht folgen: NICHTS sehen wie Instagram
+            lockedScreen
+          ) : (
+            <>
+              {/* Liste */}
+              <FlatList
+                ref={listRef}
+                data={combinedMessages}
+                keyExtractor={(it) => it.id}
+                renderItem={renderItem}
+                contentContainerStyle={{
+                  paddingHorizontal: PAD_H,
+                  paddingTop: PAD_TOP,
+                  paddingBottom: composerH + (replyToId ? 44 : 0) + Math.max(insets.bottom, 2),
                 }}
-                onBlur={() => setShowEmojiFor(null)}
-                multiline
-                returnKeyType="send"
-                blurOnSubmit={false}
-                onSubmitEditing={() => hasText && sendMessage()}
+                showsVerticalScrollIndicator={false}
+                keyboardShouldPersistTaps="handled"
+                keyboardDismissMode={Platform.OS === "ios" ? "on-drag" : "none"}
+                onScrollBeginDrag={() => {
+                  Keyboard.dismiss();
+                  setShowEmojiFor(null);
+                }}
+                onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: false })}
+                onLayout={() => requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: false }))}
+                onScroll={(e) => setScrollY(e.nativeEvent.contentOffset.y)}
+                scrollEventThrottle={16}
+                scrollEnabled={!recOn}
               />
-            </View>
 
-            {/* Galerie (nur wenn nicht recording) */}
-            {!recOn && (
-              <TouchableOpacity style={styles.iconCircle} onPress={pickMedia}>
-                <Ionicons name="image-outline" size={18} color="#fff" />
-              </TouchableOpacity>
-            )}
+              {/* Emoji-Overlay */}
+              {emojiOverlay}
 
-            {/* Mic / Senden */}
-            {hasText ? (
-              <TouchableOpacity style={[styles.iconCircle, styles.sendBtn]} onPress={sendMessage}>
-                <Ionicons name="send" size={18} color="#fff" />
-              </TouchableOpacity>
-            ) : (
-              <View style={styles.micWrap} {...pan.panHandlers}>
-                <Animated.View style={{ transform: [{ scale: micScale }] }}>
-                  <TouchableOpacity
-                    style={[styles.iconCircle, recOn ? styles.micActive : null]}
-                    onPressIn={startVoice}
-                    onPressOut={() => {
-                      if (recOn && !recLocked) stopAndSendVoice();
+              {/* Reply-Preview */}
+              {replyPreview}
+
+              {/* Recording Banner */}
+              {recOn && (
+                <View style={styles.recordBanner}>
+                  <View className="dot" style={styles.dot} />
+                  <Text style={styles.recordText}>Aufnahme läuft…</Text>
+                  <Text style={styles.recordTimer}>{msToClock(recMs)}</Text>
+                  {recLocked && (
+                    <TouchableOpacity onPress={stopAndSendVoice} style={styles.stopBtn}>
+                      <Ionicons name="stop" size={16} color="#fff" />
+                    </TouchableOpacity>
+                  )}
+                </View>
+              )}
+
+              {/* Options-Backdrop */}
+              {showOptions && (
+                <View style={StyleSheet.absoluteFill} pointerEvents="box-none">
+                  <TouchableOpacity style={StyleSheet.absoluteFill} activeOpacity={1} onPress={() => setShowOptions(false)} />
+                  <OptionsMenu input={input} setInput={setInput} onClose={() => setShowOptions(false)} />
+                </View>
+              )}
+
+              {/* Composer */}
+              <View style={styles.composer} onLayout={(e) => setComposerH(e.nativeEvent.layout.height)}>
+                {/* Kamera */}
+                <TouchableOpacity style={styles.iconCircle} onPress={() => openCameraModal("photo")} onLongPress={chooseCameraMode}>
+                  <Ionicons name="camera-outline" size={18} color="#fff" />
+                </TouchableOpacity>
+
+                {/* Eingabe */}
+                <View style={styles.inputWrap}>
+                  <TextInput
+                    style={styles.input}
+                    placeholder={replyToId ? "Antwort schreiben…" : "Nachricht schreiben…"}
+                    placeholderTextColor="#8a8a8a"
+                    value={input}
+                    onChangeText={setInput}
+                    onFocus={() => {
+                      setShowEmojiFor(null);
+                      requestAnimationFrame(() => listRef.current?.scrollToEnd({ animated: true }));
                     }}
-                    activeOpacity={0.9}
-                  >
-                    <Ionicons name="mic-outline" size={18} color="#fff" />
+                    onBlur={() => setShowEmojiFor(null)}
+                    multiline
+                    returnKeyType="send"
+                    blurOnSubmit={false}
+                    onSubmitEditing={() => hasText && sendMessage()}
+                  />
+                </View>
+
+                {/* Galerie (nur wenn nicht recording) */}
+                {!recOn && (
+                  <TouchableOpacity style={styles.iconCircle} onPress={pickMedia}>
+                    <Ionicons name="image-outline" size={18} color="#fff" />
                   </TouchableOpacity>
-                </Animated.View>
+                )}
+
+                {/* Mic / Senden */}
+                {hasText ? (
+                  <TouchableOpacity style={[styles.iconCircle, styles.sendBtn]} onPress={sendMessage}>
+                    <Ionicons name="send" size={18} color="#fff" />
+                  </TouchableOpacity>
+                ) : (
+                  <View style={styles.micWrap} {...pan.panHandlers}>
+                    <Animated.View style={{ transform: [{ scale: micScale }] }}>
+                      <TouchableOpacity
+                        style={[styles.iconCircle, recOn ? styles.micActive : null]}
+                        onPressIn={startVoice}
+                        onPressOut={() => {
+                          if (recOn && !recLocked) stopAndSendVoice();
+                        }}
+                        activeOpacity={0.9}
+                      >
+                        <Ionicons name="mic-outline" size={18} color="#fff" />
+                      </TouchableOpacity>
+                    </Animated.View>
+                  </View>
+                )}
               </View>
-            )}
-          </View>
+            </>
+          )}
         </View>
       </KeyboardAvoider>
 
       {/* Kamera-Modal (lädt selbst hoch & gibt http-URL zurück) */}
-      {threadChatId ? (
+      {!privacyLoading && !isLocked && threadChatId ? (
         <CameraModal
           visible={camOpen}
           onClose={() => setCamOpen(false)}
@@ -1068,4 +1188,52 @@ const styles = StyleSheet.create({
     alignItems: "center",
     justifyContent: "center",
   },
+
+  // 🔒 Privacy UI
+  loadingWrap: { flex: 1, alignItems: "center", justifyContent: "center", gap: 10 },
+  loadingText: { color: "#aaa", fontSize: 12 },
+
+  lockWrap: { flex: 1, alignItems: "center", justifyContent: "center", paddingHorizontal: 18 },
+  lockCard: {
+    width: "100%",
+    maxWidth: 420,
+    backgroundColor: "#141414",
+    borderWidth: 1,
+    borderColor: "#222",
+    borderRadius: 16,
+    padding: 16,
+    alignItems: "center",
+  },
+  lockIcon: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    backgroundColor: "#1f1f1f",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 10,
+  },
+  lockTitle: { color: "#fff", fontSize: 16, fontWeight: "700", marginBottom: 6 },
+  lockText: { color: "#aaa", fontSize: 12, textAlign: "center", lineHeight: 16 },
+
+  followBtn: {
+    width: "100%",
+    backgroundColor: "#ff4fd8",
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: "center",
+  },
+  followBtnText: { color: "#fff", fontWeight: "700" },
+
+  refreshBtn: {
+    marginTop: 10,
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: "#1f1f1f",
+  },
+  refreshText: { color: "#fff", fontSize: 12, fontWeight: "600" },
 });

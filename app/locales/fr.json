@@ -1,0 +1,8 @@
+{
+  "language": {
+    "title": "Langue",
+    "activeLanguage": "Langue Active",
+    "hint": "Cette paramètre s'applique à l'ensemble de l'application.",
+    "saving": "Enregistrement..."
+  }
+}
